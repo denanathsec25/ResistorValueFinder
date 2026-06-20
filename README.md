@@ -74,18 +74,20 @@ Camera access requires **HTTPS** in production — all major static hosts provid
   body and skip the manual "align in box" step.
 - **PWA / offline:** Add a Vite PWA plugin and a service worker to cache assets.
 
-Author
-Denanath S
+## Author
+
+**Denanath S**
 
 Electronics and Communication Engineering (ECE)
 
 Bannari Amman Institute of Technology
 
-📧 Email: denanathshanmugasundaram@gmail.com
+📧 Email: [denanathshanmugasundaram@gmail.com](mailto:denanathshanmugasundaram@gmail.com)
 
 🔗 GitHub: https://github.com/denanathsec25
 
-Support
+## Support
+
 If you find this repository useful for learning Verilog, FPGA Design, or Digital Electronics:
 
 ⭐ Star the repository
