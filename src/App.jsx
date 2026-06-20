@@ -1,6 +1,6 @@
 import { useState, useRef, useEffect, useCallback } from "react";
-import { COLOR_BANDS, matchColor, calcResistance, formatOhms } from "./resistorLogic";
-import { extractBands } from "./cvProcessing";
+import { calcResistance, formatOhms } from "./resistorLogic";
+import { burstCaptureAndClassify } from "./cvProcessing";
 import ResistorVisual from "./components/ResistorVisual";
 import BandsDisplay from "./components/BandsDisplay";
 import ColorReference from "./components/ColorReference";
@@ -9,54 +9,54 @@ import "./index.css";
 export default function App() {
   const videoRef = useRef(null);
   const procCanvasRef = useRef(null);
-  const rafRef = useRef(null);
 
   const [mode, setMode] = useState("camera"); // "camera" | "ref"
   const [numBands, setNumBands] = useState(4);
   const [streaming, setStreaming] = useState(false);
-  const [analyzing, setAnalyzing] = useState(false);
+  const [capturing, setCapturing] = useState(false); // brief flash while processing
   const [status, setStatus] = useState("Idle — press Start");
   const [bands, setBands] = useState(null);
   const [result, setResult] = useState(null);
   const [error, setError] = useState(null);
   const [facingMode, setFacingMode] = useState("environment");
 
-  // ── Core frame-processing loop ──────────────────────────────────────────────
-  const processFrame = useCallback(() => {
+  // ── Burst capture & majority-vote analyze ───────────────────────────────────
+  const handleCapture = useCallback(async () => {
     const video = videoRef.current;
     const canvas = procCanvasRef.current;
     if (!video || !canvas || video.readyState < 2) return;
 
-    const ctx = canvas.getContext("2d");
-    canvas.width = video.videoWidth || 320;
-    canvas.height = video.videoHeight || 180;
-    ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
+    setCapturing(true);
+    setStatus("Capturing burst…");
 
     try {
-      const detectedBands = extractBands(ctx, canvas.width, canvas.height, numBands);
-      const res = calcResistance(detectedBands, numBands);
-      setBands(detectedBands);
+      // Samples ~10 frames over ~400ms and takes a per-band majority vote —
+      // this is what stops single-frame glare/motion-blur from producing
+      // wildly wrong reads.
+      const votedBands = await burstCaptureAndClassify(video, canvas, numBands, {
+        frameCount: 10,
+        intervalMs: 40,
+      });
+      const res = calcResistance(votedBands, numBands);
+      setBands(votedBands);
       setResult(res);
+
+      const avgConfidence =
+        votedBands.reduce((sum, b) => sum + b.confidence, 0) / votedBands.length;
+      const confidencePct = Math.round(avgConfidence * 100);
+
+      setStatus(
+        res
+          ? `Capture complete — ${confidencePct}% confidence`
+          : `Capture complete — check alignment (${confidencePct}% confidence)`
+      );
     } catch (e) {
-      console.warn("Frame processing error:", e);
+      console.warn("Capture processing error:", e);
+      setStatus("Error processing frame — try again");
+    } finally {
+      setCapturing(false);
     }
   }, [numBands]);
-
-  const startAnalysis = useCallback(() => {
-    setAnalyzing(true);
-    setStatus("Analyzing…");
-    const loop = () => {
-      processFrame();
-      rafRef.current = requestAnimationFrame(loop);
-    };
-    rafRef.current = requestAnimationFrame(loop);
-  }, [processFrame]);
-
-  const stopAnalysis = useCallback(() => {
-    setAnalyzing(false);
-    setStatus("Paused");
-    if (rafRef.current) cancelAnimationFrame(rafRef.current);
-  }, []);
 
   const startCamera = useCallback(async () => {
     setError(null);
@@ -68,7 +68,7 @@ export default function App() {
         videoRef.current.srcObject = stream;
         await videoRef.current.play();
         setStreaming(true);
-        setStatus("Camera active — press Analyze");
+        setStatus("Camera active — align resistor and press Capture");
       }
     } catch (e) {
       setError("Camera access denied or unavailable. Check browser permissions.");
@@ -77,16 +77,16 @@ export default function App() {
   }, [facingMode]);
 
   const stopCamera = useCallback(() => {
-    stopAnalysis();
     if (videoRef.current?.srcObject) {
       videoRef.current.srcObject.getTracks().forEach((t) => t.stop());
       videoRef.current.srcObject = null;
     }
     setStreaming(false);
+    setCapturing(false);
     setBands(null);
     setResult(null);
     setStatus("Idle — press Start");
-  }, [stopAnalysis]);
+  }, []);
 
   // Cleanup on unmount
   useEffect(() => () => stopCamera(), []);
@@ -143,11 +143,13 @@ export default function App() {
                     <span className="corner tr" />
                     <span className="corner bl" />
                     <span className="corner br" />
-                    {analyzing && <div className="scan-line" />}
+                    {capturing && <div className="scan-line" />}
                   </div>
                   <p className="hint-text">Align resistor within box</p>
                 </div>
               )}
+
+              {capturing && <div className="flash-overlay" />}
 
               {!streaming && (
                 <div className="camera-placeholder">
@@ -161,7 +163,7 @@ export default function App() {
             <div className="status-bar">
               <span
                 className={`dot ${
-                  analyzing ? "analyzing" : streaming ? "active" : "idle"
+                  capturing ? "analyzing" : streaming ? "active" : "idle"
                 }`}
               />
               <span>{status}</span>
@@ -197,20 +199,18 @@ export default function App() {
                   ▶ Start Camera
                 </button>
               ) : (
-                <button className="btn danger" onClick={stopCamera}>
-                  ■ Stop
-                </button>
-              )}
-              {streaming && (
-                !analyzing ? (
-                  <button className="btn primary" onClick={startAnalysis}>
-                    ⟳ Analyze
+                <>
+                  <button className="btn danger" onClick={stopCamera}>
+                    ■ Stop
                   </button>
-                ) : (
-                  <button className="btn secondary" onClick={stopAnalysis}>
-                    ⏸ Pause
+                  <button
+                    className="btn primary capture-btn"
+                    onClick={handleCapture}
+                    disabled={capturing}
+                  >
+                    {capturing ? "● Capturing…" : "📸 Capture"}
                   </button>
-                )
+                </>
               )}
             </div>
           </>

@@ -120,6 +120,8 @@ body {
 }
 
 /* ── Camera viewfinder ───────────────────────────────────────────────────── */
+/* Fixed aspect-ratio box prevents tall portrait camera streams on mobile
+   from pushing the Capture/Stop buttons off-screen below the fold. */
 .camera-wrap {
   position: relative;
   width: 100%;
@@ -180,13 +182,12 @@ body {
   right: 0;
   height: 2px;
   background: linear-gradient(90deg, transparent, var(--amber), transparent);
-  animation: scan 2s ease-in-out infinite;
+  animation: scan 0.35s ease-in-out;
 }
 
 @keyframes scan {
   0%   { top: 0;    opacity: 0; }
-  10%  { opacity: 1; }
-  90%  { opacity: 1; }
+  20%  { opacity: 1; }
   100% { top: 100%; opacity: 0; }
 }
 
@@ -203,15 +204,34 @@ body {
   opacity: 0.85;
 }
 
+/* Brief white flash on capture — mimics a camera shutter */
+.flash-overlay {
+  position: absolute;
+  inset: 0;
+  background: #fff;
+  opacity: 0;
+  animation: flash 0.35s ease-out;
+  pointer-events: none;
+}
+
+@keyframes flash {
+  0%   { opacity: 0.6; }
+  100% { opacity: 0; }
+}
+
 .camera-placeholder {
+  position: absolute;
+  inset: 0;
   display: flex;
   flex-direction: column;
   align-items: center;
+  justify-content: center;
   gap: 10px;
-  padding: 40px 24px;
+  padding: 24px;
   color: var(--muted);
   font-size: 11px;
   letter-spacing: 1px;
+  text-align: center;
 }
 
 .camera-icon {
@@ -241,7 +261,7 @@ body {
 }
 .dot.idle      { background: var(--muted); }
 .dot.active    { background: var(--green);  animation: pulse 1.5s infinite; }
-.dot.analyzing { background: var(--amber); animation: pulse 0.6s infinite; }
+.dot.analyzing { background: var(--amber); animation: pulse 0.4s infinite; }
 
 @keyframes pulse {
   0%, 100% { opacity: 1; }
@@ -307,7 +327,7 @@ body {
 
 .btn {
   flex: 1;
-  padding: 10px 14px;
+  padding: 12px 14px;
   border-radius: var(--radius);
   border: 1px solid var(--border);
   background: var(--surface2);
@@ -327,6 +347,18 @@ body {
   font-weight: bold;
 }
 .btn.primary:hover { background: var(--amber-dim); border-color: var(--amber-dim); }
+
+.btn.primary:disabled {
+  background: var(--amber-dim);
+  opacity: 0.7;
+  cursor: not-allowed;
+}
+
+/* Capture button gets a bit more visual weight — it's the primary action */
+.capture-btn {
+  flex: 1.4;
+  font-size: 12px;
+}
 
 .btn.secondary:hover { border-color: var(--amber); color: var(--amber); }
 
@@ -423,6 +455,21 @@ body {
   color: var(--muted);
   letter-spacing: 1px;
   text-align: center;
+}
+
+.confidence-bar-track {
+  width: 100%;
+  height: 3px;
+  background: var(--border);
+  border-radius: 2px;
+  overflow: hidden;
+  margin-top: 2px;
+}
+
+.confidence-bar-fill {
+  height: 100%;
+  border-radius: 2px;
+  transition: width 0.2s ease;
 }
 
 /* ── Ohms display ────────────────────────────────────────────────────────── */
