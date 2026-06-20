@@ -1,99 +1,347 @@
-# ResiBand — Resistor Color Band Decoder
+# ResiBand — Real-Time 4-Band & 5-Band Resistor Color Decoder
 
-Real-time resistor colour band decoder using your device's camera. No native apps, no
-heavy libraries — pure React + Canvas 2D API, runs at 30 fps on mid-range mobile.
+![React](https://img.shields.io/badge/React-Frontend-blue)
+![Vite](https://img.shields.io/badge/Vite-Build%20Tool-purple)
+![Canvas API](https://img.shields.io/badge/Canvas-Image%20Processing-green)
+![Vercel](https://img.shields.io/badge/Deployed%20on-Vercel-black)
+![License](https://img.shields.io/badge/License-MIT-yellow.svg)
 
-## Quick start
+🔴 **Live Demo:** https://resistor-value-finder.vercel.app/
+
+ResiBand is a browser-based resistor color band decoder that uses your device's camera to identify resistor color bands and calculate resistance values in real time.
+
+Built using **React**, **Vite**, and the **HTML5 Canvas API**, the application performs lightweight computer vision and image processing directly in the browser without requiring native applications or heavy external libraries.
+
+Designed for students, hobbyists, educators, and electronics enthusiasts, ResiBand provides a fast and interactive way to decode resistor values using only a smartphone or computer camera.
+
+---
+
+## Features
+
+- Real-time resistor color band detection
+- Supports both 4-band and 5-band resistors
+- Instant resistance value calculation
+- Automatic tolerance identification
+- Resistance range calculation (minimum and maximum values)
+- Live camera processing using Canvas API
+- Mobile-friendly interface
+- Browser-based camera access
+- Lightweight image-processing pipeline
+- No OpenCV dependency
+- No installation required
+- Works on desktop and mobile browsers
+
+---
+
+## Live Website
+
+🌐 **Try ResiBand Online**
+
+https://resistor-value-finder.vercel.app/
+
+> Camera permission is required for real-time resistor detection.
+
+---
+
+## Demo Workflow
+
+1. Open the website.
+2. Allow camera access.
+3. Select 4-band or 5-band mode.
+4. Align the resistor inside the guide area.
+5. The application detects the resistor bands.
+6. Resistance value and tolerance are calculated instantly.
+
+---
+
+## Technology Stack
+
+### Frontend
+
+- React.js
+- Vite
+- JavaScript (ES6+)
+- HTML5
+- CSS3
+
+### Browser APIs
+
+- MediaDevices API
+- Canvas 2D API
+- RequestAnimationFrame API
+
+### Deployment
+
+- Vercel
+
+---
+
+## Project Structure
+
+```text
+src/
+├── main.jsx                 # React entry point
+├── App.jsx                  # Main application component
+├── index.css                # Global styling
+├── resistorLogic.js         # Color matching and resistance calculations
+├── cvProcessing.js          # Image processing functions
+└── components/
+    ├── ResistorVisual.jsx   # Resistor visualization
+    ├── BandsDisplay.jsx     # Detected band display
+    └── ColorReference.jsx   # Color code reference table
+```
+
+---
+
+## How It Works
+
+### 1. Camera Capture
+
+The application accesses the device camera using:
+
+```javascript
+navigator.mediaDevices.getUserMedia()
+```
+
+Video frames are streamed into a hidden HTML5 canvas for processing.
+
+---
+
+### 2. Image Processing
+
+For every frame:
+
+- Raw pixel data is extracted from the canvas.
+- A lightweight blur filter reduces sensor noise.
+- A Region of Interest (ROI) is selected.
+- Band sampling locations are analyzed.
+- Average RGB values are calculated for each band.
+
+---
+
+### 3. Color Matching
+
+Detected RGB values are compared against standard resistor color references using Euclidean distance in RGB space.
+
+Supported resistor colors:
+
+| Color | Digit |
+|--------|--------|
+| Black | 0 |
+| Brown | 1 |
+| Red | 2 |
+| Orange | 3 |
+| Yellow | 4 |
+| Green | 5 |
+| Blue | 6 |
+| Violet | 7 |
+| Grey | 8 |
+| White | 9 |
+
+Additional multiplier and tolerance colors are also supported.
+
+---
+
+### 4. Resistance Calculation
+
+#### 4-Band Resistor
+
+```text
+Resistance = (Band1 × 10 + Band2) × Multiplier
+```
+
+#### 5-Band Resistor
+
+```text
+Resistance = (Band1 × 100 + Band2 × 10 + Band3) × Multiplier
+```
+
+The application calculates:
+
+- Resistance value
+- Tolerance percentage
+- Minimum resistance
+- Maximum resistance
+
+---
+
+## Local Development
+
+Clone the repository:
+
+```bash
+git clone https://github.com/denanathsec25/resistor-value-finder.git
+```
+
+Navigate into the project:
+
+```bash
+cd resistor-value-finder
+```
+
+Install dependencies:
 
 ```bash
 npm install
+```
+
+Run the development server:
+
+```bash
 npm run dev
 ```
 
-Then open `http://localhost:5173` in your browser (or scan the QR code / LAN URL for mobile).
+Open:
 
-> **Mobile testing tip:** Vite exposes the dev server on your LAN (`host: true` in vite.config.js).
-> Open the LAN address on your phone while on the same Wi-Fi network.
-
-## Project structure
-
-```
-src/
-├── main.jsx              # React entry point
-├── App.jsx               # Root component — camera control, state, layout
-├── index.css             # Global styles (dark industrial theme)
-├── resistorLogic.js      # Pure functions: colour table, matching, math, formatting
-├── cvProcessing.js       # Canvas 2D image processing (band sampling)
-└── components/
-    ├── ResistorVisual.jsx # Schematic illustration of resistor body
-    ├── BandsDisplay.jsx   # Colour swatches + band name chips
-    └── ColorReference.jsx # Quick-reference colour-code grid
+```text
+http://localhost:5173
 ```
 
-## How it works
+---
 
-### Camera layer
-`MediaDevices.getUserMedia()` streams video into a `<video>` element.
-A `requestAnimationFrame` loop copies each frame to a hidden `<canvas>`.
+## Production Build
 
-### Image processing (`cvProcessing.js`)
-1. `getImageData()` reads raw RGBA pixels from the canvas.
-2. A lightweight 3×3 box blur smooths sensor noise inside the ROI.
-3. The Region of Interest (centre 70% × 40% of the frame) is divided into
-   `2N + 1` slots — gaps between odd slots, bands on odd slots.
-4. Each band slot is averaged to a single [R, G, B] triple.
-
-### Colour matching (`resistorLogic.js → matchColor`)
-Euclidean distance in RGB space against the 12 standard resistor colours.
-Fast for a fixed palette; no HSV conversion needed.
-
-### Resistance calculation (`resistorLogic.js → calcResistance`)
-| Scheme | Formula |
-|--------|---------|
-| 4-band | `(d1×10 + d2) × multiplier` |
-| 5-band | `(d1×100 + d2×10 + d3) × multiplier` |
-
-Outputs value, tolerance %, min, and max.
-
-## Build for production
+Generate a production build:
 
 ```bash
 npm run build
-# outputs to dist/
 ```
 
-Deploy `dist/` to any static host (Vercel, Netlify, GitHub Pages, etc.).
-Camera access requires **HTTPS** in production — all major static hosts provide this.
+Output files will be generated in:
 
-## Extending
+```text
+dist/
+```
 
-- **Better colour accuracy under variable lighting:** Apply histogram equalisation
-  or convert to LAB colour space before matching. OpenCV.js can be dropped in as
-  a WASM module if needed; replace `extractBands` in `cvProcessing.js`.
-- **Edge detection:** Use Canny on the grayscale frame to auto-locate the resistor
-  body and skip the manual "align in box" step.
-- **PWA / offline:** Add a Vite PWA plugin and a service worker to cache assets.
+---
+
+## Deployment
+
+This project is deployed on **Vercel**.
+
+To deploy your own version:
+
+1. Fork the repository
+2. Import the repository into Vercel
+3. Deploy
+
+Camera access requires HTTPS in production environments.
+
+---
+
+## Applications
+
+ResiBand can be used for:
+
+- Electronics laboratory experiments
+- Engineering education
+- DIY electronics projects
+- Circuit troubleshooting
+- STEM learning activities
+- Embedded systems prototyping
+- Hardware development and testing
+- Quick resistor identification during circuit assembly
+
+---
+
+## Future Enhancements
+
+- Support for 6-band resistors
+- Temperature coefficient detection
+- Automatic resistor body localization
+- Adaptive lighting correction
+- LAB color-space classification
+- AI-assisted color recognition
+- SMD resistor code recognition
+- Offline PWA support
+- Scan history and analytics
+- Export results as PDF/CSV
+- Multi-language interface
+
+---
+
+## Why ResiBand?
+
+Unlike traditional resistor calculators that require manual color selection, ResiBand performs real-time visual detection directly from the camera feed.
+
+The project demonstrates practical applications of:
+
+- Computer Vision
+- Image Processing
+- Frontend Engineering
+- Browser APIs
+- Electronics Fundamentals
+- Human–Computer Interaction
+
+while remaining lightweight enough to run entirely inside a web browser.
+
+---
+
+## Development Note
+
+ResiBand was independently developed by **Denanath Shanmugasundaram** as an Electronics and Computer Vision project.
+
+Modern AI-assisted development tools were utilized during the development process for:
+
+- Code generation assistance
+- Debugging support
+- Documentation refinement
+- UI/UX improvements
+- Rapid prototyping and technical brainstorming
+
+The overall system design, computer vision workflow, resistance calculation logic, testing, deployment, and project ownership remain the work of the author.
+
+---
 
 ## Author
 
-**Denanath S**
+### Denanath Shanmugasundaram
 
-Electronics and Communication Engineering (ECE)
+**Electronics and Communication Engineering (ECE)**  
+**Bannari Amman Institute of Technology**
 
-Bannari Amman Institute of Technology
-
-📧 Email: [denanathshanmugasundaram@gmail.com](mailto:denanathshanmugasundaram@gmail.com)
+📧 Email: denanathshanmugasundaram@gmail.com
 
 🔗 GitHub: https://github.com/denanathsec25
 
+🌐 Live Website: https://resistor-value-finder.vercel.app/
+
+---
+
+## Contributing
+
+Contributions, suggestions, and improvements are welcome.
+
+To contribute:
+
+1. Fork the repository
+2. Create a feature branch
+3. Commit your changes
+4. Push the branch
+5. Open a Pull Request
+
+---
+
+## License
+
+This project is licensed under the MIT License.
+
+See the [LICENSE](LICENSE) file for details.
+
+---
+
 ## Support
 
-If you find this repository useful for learning Verilog, FPGA Design, or Digital Electronics:
+If you found this project useful:
 
 ⭐ Star the repository
 
-🍴 Fork it for your own experiments
+🍴 Fork the project
 
-📢 Share it with fellow students and FPGA enthusiasts
+📢 Share it with fellow students, makers, and electronics enthusiasts
 
-Contributions, suggestions, and feedback are always welcome.
+Your support helps improve the project and encourages future development.
+
+---
+
+### Built with React, Canvas API, Computer Vision concepts, and a passion for Electronics Engineering.
