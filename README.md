@@ -73,3 +73,25 @@ Camera access requires **HTTPS** in production — all major static hosts provid
 - **Edge detection:** Use Canny on the grayscale frame to auto-locate the resistor
   body and skip the manual "align in box" step.
 - **PWA / offline:** Add a Vite PWA plugin and a service worker to cache assets.
+
+Author
+Denanath S
+
+Electronics and Communication Engineering (ECE)
+
+Bannari Amman Institute of Technology
+
+📧 Email: denanathshanmugasundaram@gmail.com
+
+🔗 GitHub: https://github.com/denanathsec25
+
+Support
+If you find this repository useful for learning Verilog, FPGA Design, or Digital Electronics:
+
+⭐ Star the repository
+
+🍴 Fork it for your own experiments
+
+📢 Share it with fellow students and FPGA enthusiasts
+
+Contributions, suggestions, and feedback are always welcome.
