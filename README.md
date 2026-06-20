@@ -279,7 +279,7 @@ while remaining lightweight enough to run entirely inside a web browser.
 
 ## Development Note
 
-ResiBand was independently developed by **Denanath Shanmugasundaram** as an Electronics and Computer Vision project.
+ResiBand was independently developed by **Denanath S** as an Electronics and Computer Vision project.
 
 Modern AI-assisted development tools were utilized during the development process for:
 
@@ -295,7 +295,7 @@ The overall system design, computer vision workflow, resistance calculation logi
 
 ## Author
 
-### Denanath Shanmugasundaram
+### Denanath S
 
 **Electronics and Communication Engineering (ECE)**  
 **Bannari Amman Institute of Technology**
