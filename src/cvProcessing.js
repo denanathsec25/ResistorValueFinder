@@ -2,21 +2,38 @@
 // cvProcessing.js
 // Browser-native image processing using the Canvas 2D API.
 //
-// v2 CHANGES (fixes color misclassification under glare/glossy resistors):
-//   1. ROBUST SAMPLING — median instead of mean per band window, with
-//      explicit rejection of specular-highlight pixels (blown-out glare)
-//      and near-black shadow pixels before computing the median. A single
-//      bright glint pixel can no longer drag an entire Yellow band toward
-//      "White."
-//   2. TEMPORAL VOTING — `burstCaptureAndClassify()` samples several frames
-//      in quick succession and takes a per-band majority vote. This smooths
-//      out motion blur, autofocus hunting, and momentary glare from a single
-//      unlucky frame.
+// v3 CHANGES (fixes "100% confidence, all bands read White"):
+//
+//   1. GEOMETRY-CORRECTED ROI (the primary fix) — sampling coordinates are
+//      now mapped through getVisibleCropRect() from videoGeometry.js, so the
+//      ROI matches the actual cropped window the user sees on screen, not
+//      the full native camera frame. Previously these could diverge by
+//      20-30%+ on phones, causing the algorithm to sample background pixels
+//      instead of the resistor — deterministically, every frame, hence the
+//      false 100% confidence.
+//
+//   2. GRAY-WORLD WHITE BALANCE — corrects color casts from ambient lighting
+//      (warm indoor bulbs, cool LED, etc.) before classification, so genuine
+//      Brown/Red/Gold bands aren't desaturated into the achromatic family.
+//
+//   3. EXPOSURE GATING — frames where too much of the ROI is sensor-clipped
+//      (true glare/overexposure, not a geometry bug) are now REJECTED from
+//      the burst vote rather than silently classified. If every frame in a
+//      burst is overexposed, a CaptureQualityError is thrown instead of
+//      returning a confident-but-wrong answer.
+//
+//   4. UNREADABLE_BAND sentinel — if an individual band window still has too
+//      few valid (non-clipped, non-shadow) pixels after all of the above, it
+//      is reported as "Unreadable" rather than guessed as a real color.
 // ─────────────────────────────────────────────────────────────────────────────
 
-import { matchColor } from "./resistorLogic";
+import { matchColor, UNREADABLE_BAND } from "./resistorLogic";
+import { getVisibleCropRect } from "./videoGeometry";
 
-// ── ROI constants (fraction of frame dimensions) ──────────────────────────────
+// ── ROI constants (fractions of the VISIBLE/displayed window) ─────────────────
+// These match the on-screen amber target-box position — see .target-box in
+// index.css (centered, 70% wide, 28% tall — these are intentionally a touch
+// larger to give a small margin around it).
 const ROI_X      = 0.15;
 const ROI_WIDTH  = 0.70;
 const ROI_Y      = 0.30;
@@ -27,14 +44,27 @@ const SAMPLE_HEIGHT_FRACTION = 0.80;
 const MIN_SAMPLE_PX          = 4;
 
 // Glare / shadow rejection thresholds (0-1 normalized).
-// A pixel is rejected as "specular glare" if it's both very bright AND
-// nearly colorless (the classic look of a reflected light source on a
-// glossy resistor coating).
 const GLARE_VALUE_MIN  = 0.92;
 const GLARE_SAT_MAX    = 0.12;
-// A pixel is rejected as "shadow/background" if it's almost black —
-// these usually come from the gap between bands, not the bands themselves.
 const SHADOW_VALUE_MAX = 0.04;
+
+// If fewer than this fraction of a band window's pixels survive glare/shadow
+// rejection, the band is reported as UNREADABLE rather than guessed.
+const MIN_VALID_PIXEL_RATIO = 0.15;
+
+// If more than this fraction of the WHOLE ROI is clipped, the entire frame
+// is discarded from the burst vote (true overexposure, not worth sampling).
+const FRAME_CLIP_RATIO_THRESHOLD = 0.5;
+
+// ── Custom error for capture-quality failures ──────────────────────────────────
+
+export class CaptureQualityError extends Error {
+  constructor(message, reason) {
+    super(message);
+    this.name = "CaptureQualityError";
+    this.reason = reason; // "overexposed" | "video-not-ready"
+  }
+}
 
 // ── Robust statistics helpers ──────────────────────────────────────────────────
 
@@ -47,22 +77,19 @@ function median(arr) {
 }
 
 /**
- * Sample a rectangular pixel block, rejecting glare/shadow outliers first,
- * then return the per-channel MEDIAN (robust to the outliers a simple mean
- * would still be skewed by).
- *
- * @param {Uint8ClampedArray} data    – ImageData.data
- * @param {number} x, y, w, h         – block in pixel coords
- * @param {number} imgWidth           – full canvas width (stride)
- * @returns {[number, number, number]} [r, g, b]
+ * Sample a rectangular pixel block, rejecting glare/shadow outliers, then
+ * return the per-channel MEDIAN plus the fraction of pixels that were valid
+ * (not rejected). A low validRatio signals the window was mostly glare.
  */
 function robustSampleBlock(data, x, y, w, h, imgWidth) {
   const rs = [], gs = [], bs = [];
+  let total = 0;
 
   for (let dy = 0; dy < h; dy++) {
     for (let dx = 0; dx < w; dx++) {
       const idx = ((y + dy) * imgWidth + (x + dx)) * 4;
       const r = data[idx], g = data[idx + 1], b = data[idx + 2];
+      total++;
 
       const max = Math.max(r, g, b) / 255;
       const min = Math.min(r, g, b) / 255;
@@ -76,8 +103,10 @@ function robustSampleBlock(data, x, y, w, h, imgWidth) {
     }
   }
 
-  // Fallback: if filtering rejected every pixel (e.g. the whole window is
-  // blown out), redo without filtering rather than returning garbage.
+  const validRatio = total ? rs.length / total : 0;
+
+  // Still compute a display-able color even on total rejection (for the
+  // swatch UI) — but validRatio will correctly mark it unreliable.
   if (rs.length === 0) {
     for (let dy = 0; dy < h; dy++) {
       for (let dx = 0; dx < w; dx++) {
@@ -87,27 +116,96 @@ function robustSampleBlock(data, x, y, w, h, imgWidth) {
     }
   }
 
-  return [median(rs), median(gs), median(bs)];
+  return { r: median(rs), g: median(gs), b: median(bs), validRatio };
+}
+
+// ── Gray-world white balance ───────────────────────────────────────────────────
+
+/**
+ * Estimate per-channel gain to neutralize a color cast from ambient
+ * lighting, using the classic gray-world assumption (the average color of
+ * a sufficiently varied scene should be neutral gray). Gains are clamped to
+ * avoid amplifying noise when the assumption doesn't hold well.
+ */
+function computeGrayWorldGains(imageData) {
+  const data = imageData.data;
+  const STRIDE = 4 * 5; // sample every 5th pixel — plenty for a stable average, much faster
+  let sumR = 0, sumG = 0, sumB = 0, count = 0;
+
+  for (let i = 0; i < data.length; i += STRIDE) {
+    sumR += data[i]; sumG += data[i + 1]; sumB += data[i + 2]; count++;
+  }
+  if (count === 0) return { gainR: 1, gainG: 1, gainB: 1 };
+
+  const avgR = sumR / count, avgG = sumG / count, avgB = sumB / count;
+  const avgGray = (avgR + avgG + avgB) / 3 || 1;
+
+  const MAX_GAIN = 1.5;
+  const MIN_GAIN = 1 / MAX_GAIN;
+  const clamp = (g) => Math.min(MAX_GAIN, Math.max(MIN_GAIN, g));
+
+  return {
+    gainR: clamp(avgGray / (avgR || 1)),
+    gainG: clamp(avgGray / (avgG || 1)),
+    gainB: clamp(avgGray / (avgB || 1)),
+  };
+}
+
+function applyGains(r, g, b, gains) {
+  return [
+    Math.min(255, r * gains.gainR),
+    Math.min(255, g * gains.gainG),
+    Math.min(255, b * gains.gainB),
+  ];
+}
+
+// ── ROI geometry resolution ────────────────────────────────────────────────────
+
+/**
+ * Resolve the ROI from DISPLAY-fraction space into NATIVE pixel coordinates,
+ * correcting for the object-fit:cover crop between what's shown on screen
+ * and the camera's native frame. Falls back to treating the full native
+ * frame as visible (no crop) if geometry can't be determined yet.
+ */
+function resolveNativeROI(video, canvasWidth, canvasHeight) {
+  const crop = video ? getVisibleCropRect(video) : null;
+  const visible = crop || { x: 0, y: 0, width: canvasWidth, height: canvasHeight };
+
+  return {
+    x: Math.floor(visible.x + ROI_X * visible.width),
+    y: Math.floor(visible.y + ROI_Y * visible.height),
+    w: Math.floor(ROI_WIDTH * visible.width),
+    h: Math.floor(ROI_HEIGHT * visible.height),
+  };
+}
+
+// ── Frame-level exposure check ──────────────────────────────────────────────────
+
+function computeROIClipRatio(imageData, roiX, roiY, roiW, roiH, canvasWidth) {
+  const data = imageData.data;
+  let clipped = 0, total = 0;
+  const STEP = 2; // every other pixel — fast, still representative
+
+  for (let y = roiY; y < roiY + roiH; y += STEP) {
+    for (let x = roiX; x < roiX + roiW; x += STEP) {
+      const idx = (y * canvasWidth + x) * 4;
+      const r = data[idx], g = data[idx + 1], b = data[idx + 2];
+      const max = Math.max(r, g, b) / 255;
+      const min = Math.min(r, g, b) / 255;
+      const v = max;
+      const s = max === 0 ? 0 : (max - min) / max;
+      total++;
+      if (v > GLARE_VALUE_MIN && s < GLARE_SAT_MAX) clipped++;
+    }
+  }
+  return total ? clipped / total : 0;
 }
 
 // ── Single-frame band extraction ───────────────────────────────────────────────
 
-/**
- * Extract colour-band information from the current canvas frame.
- *
- * @param {CanvasRenderingContext2D} ctx
- * @param {number} canvasWidth
- * @param {number} canvasHeight
- * @param {4 | 5} numBands
- * @returns {Array<{ band: object, r: number, g: number, b: number, hex: string }>}
- */
-export function extractBands(ctx, canvasWidth, canvasHeight, numBands) {
-  const imageData = ctx.getImageData(0, 0, canvasWidth, canvasHeight);
-
-  const roiX = Math.floor(canvasWidth * ROI_X);
-  const roiW = Math.floor(canvasWidth * ROI_WIDTH);
-  const roiY = Math.floor(canvasHeight * ROI_Y);
-  const roiH = Math.floor(canvasHeight * ROI_HEIGHT);
+function extractBandsFromImageData(imageData, canvasWidth, canvasHeight, numBands, nativeROI) {
+  const { x: roiX, y: roiY, w: roiW, h: roiH } = nativeROI;
+  const gains = computeGrayWorldGains(imageData);
 
   const slotW = roiW / (numBands * 2 + 1);
   const sampW = Math.max(MIN_SAMPLE_PX, Math.floor(slotW * SAMPLE_WIDTH_FRACTION));
@@ -120,68 +218,121 @@ export function extractBands(ctx, canvasWidth, canvasHeight, numBands) {
     const slotCentre = roiX + slotW * (i * 2 + 1.5);
     const sampX = Math.floor(slotCentre - sampW / 2);
 
-    const [r, g, b] = robustSampleBlock(
+    const { r: rawR, g: rawG, b: rawB, validRatio } = robustSampleBlock(
       imageData.data, sampX, sampY, sampW, sampH, canvasWidth
     );
 
-    const band = matchColor(r, g, b);
-    results.push({ band, r, g, b, hex: `rgb(${r},${g},${b})` });
+    const [r, g, b] = applyGains(rawR, rawG, rawB, gains);
+    const unreliable = validRatio < MIN_VALID_PIXEL_RATIO;
+    const band = unreliable ? UNREADABLE_BAND : matchColor(r, g, b);
+
+    results.push({
+      band,
+      r: Math.round(r), g: Math.round(g), b: Math.round(b),
+      hex: `rgb(${Math.round(r)},${Math.round(g)},${Math.round(b)})`,
+      validRatio,
+    });
   }
 
   return results;
 }
 
+/**
+ * Public single-frame API. Pass the live `video` element when available so
+ * the ROI can be geometry-corrected; omitting it falls back to treating the
+ * full canvas as the visible window (fine for static images / testing).
+ *
+ * @param {CanvasRenderingContext2D} ctx
+ * @param {number} canvasWidth
+ * @param {number} canvasHeight
+ * @param {4 | 5} numBands
+ * @param {HTMLVideoElement} [video]
+ */
+export function extractBands(ctx, canvasWidth, canvasHeight, numBands, video = null) {
+  const imageData = ctx.getImageData(0, 0, canvasWidth, canvasHeight);
+  const nativeROI = resolveNativeROI(video, canvasWidth, canvasHeight);
+  return extractBandsFromImageData(imageData, canvasWidth, canvasHeight, numBands, nativeROI);
+}
+
 // ── Temporal voting (burst capture) ─────────────────────────────────────────────
 
 /**
- * Take a quick burst of frames from the live video and run extractBands()
- * on each, then return the per-band MAJORITY VOTE rather than trusting any
- * single frame. This is what stops results from "wildly fluctuating" —
- * a momentary glare flash or motion-blur frame gets outvoted by the other
- * 7-11 samples in the burst.
+ * Sample a burst of frames, geometry-correct and white-balance each, reject
+ * any frame that's genuinely overexposed, then return the per-band majority
+ * vote across the surviving frames.
  *
  * @param {HTMLVideoElement} video
- * @param {HTMLCanvasElement} canvas       – scratch canvas, reused each frame
+ * @param {HTMLCanvasElement} canvas
  * @param {4 | 5} numBands
  * @param {object} [opts]
- * @param {number} [opts.frameCount=10]    – frames to sample
- * @param {number} [opts.intervalMs=40]    – delay between frames (ms)
+ * @param {number} [opts.frameCount=10]   – good frames to collect
+ * @param {number} [opts.intervalMs=40]   – delay between attempts
+ * @param {number} [opts.maxAttempts=25]  – give up after this many tries total
  * @returns {Promise<Array<{ band, r, g, b, hex, confidence }>>}
+ * @throws {CaptureQualityError} if no usable frames could be collected
  */
 export async function burstCaptureAndClassify(
   video,
   canvas,
   numBands,
-  { frameCount = 10, intervalMs = 40 } = {}
+  { frameCount = 10, intervalMs = 40, maxAttempts = 25 } = {}
 ) {
+  if (!video || video.readyState < 2) {
+    throw new CaptureQualityError("Camera feed isn't ready yet.", "video-not-ready");
+  }
+
   const ctx = canvas.getContext("2d");
-
-  // perBand[i] accumulates every frame's reading for band slot i
   const perBand = Array.from({ length: numBands }, () => []);
+  let goodFrames = 0;
+  let attempts = 0;
 
-  for (let f = 0; f < frameCount; f++) {
+  while (goodFrames < frameCount && attempts < maxAttempts) {
+    attempts++;
+
     canvas.width = video.videoWidth || 320;
     canvas.height = video.videoHeight || 180;
     ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
+    const imageData = ctx.getImageData(0, 0, canvas.width, canvas.height);
 
-    const frameBands = extractBands(ctx, canvas.width, canvas.height, numBands);
+    const nativeROI = resolveNativeROI(video, canvas.width, canvas.height);
+    const clipRatio = computeROIClipRatio(
+      imageData, nativeROI.x, nativeROI.y, nativeROI.w, nativeROI.h, canvas.width
+    );
+
+    if (clipRatio > FRAME_CLIP_RATIO_THRESHOLD) {
+      // Whole frame too blown-out to trust — skip it, try again.
+      if (attempts < maxAttempts) await sleep(intervalMs);
+      continue;
+    }
+
+    const frameBands = extractBandsFromImageData(
+      imageData, canvas.width, canvas.height, numBands, nativeROI
+    );
     frameBands.forEach((sample, i) => perBand[i].push(sample));
+    goodFrames++;
 
-    if (f < frameCount - 1) {
-      await new Promise((resolve) => setTimeout(resolve, intervalMs));
+    if (goodFrames < frameCount && attempts < maxAttempts) {
+      await sleep(intervalMs);
     }
   }
 
-  // Majority vote per band slot
+  if (goodFrames === 0) {
+    throw new CaptureQualityError(
+      "Every sampled frame was overexposed — the camera sensor is clipping to white. Reduce glare and try again.",
+      "overexposed"
+    );
+  }
+
   return perBand.map((samples) => majorityVote(samples));
 }
 
+function sleep(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
 /**
- * Given N classified samples for ONE band slot, return the most frequently
- * detected color, the averaged RGB of just the winning samples (for a clean
- * swatch), and a confidence score (winning count / total).
- *
- * @param {Array<{band, r, g, b, hex}>} samples
+ * Per-band majority vote across burst samples. Returns the winning color,
+ * the averaged RGB of just the winning samples, and a confidence score.
  */
 function majorityVote(samples) {
   const counts = new Map();
@@ -213,13 +364,12 @@ function majorityVote(samples) {
 // ── Debug helper ────────────────────────────────────────────────────────────────
 
 /**
- * Draw the sampling regions onto the canvas for visual debugging.
+ * Draw the geometry-corrected sampling regions onto a canvas for visual
+ * debugging — overlay this on a frame to confirm the ROI actually lands on
+ * the resistor body.
  */
-export function debugDrawSamplingRegions(ctx, canvasWidth, canvasHeight, numBands) {
-  const roiX = Math.floor(canvasWidth * ROI_X);
-  const roiW = Math.floor(canvasWidth * ROI_WIDTH);
-  const roiY = Math.floor(canvasHeight * ROI_Y);
-  const roiH = Math.floor(canvasHeight * ROI_HEIGHT);
+export function debugDrawSamplingRegions(ctx, canvasWidth, canvasHeight, numBands, video = null) {
+  const { x: roiX, y: roiY, w: roiW, h: roiH } = resolveNativeROI(video, canvasWidth, canvasHeight);
 
   ctx.strokeStyle = "rgba(245,166,35,0.8)";
   ctx.lineWidth = 2;

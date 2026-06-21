@@ -1,6 +1,6 @@
 import { useState, useRef, useEffect, useCallback } from "react";
 import { calcResistance, formatOhms } from "./resistorLogic";
-import { burstCaptureAndClassify } from "./cvProcessing";
+import { burstCaptureAndClassify, CaptureQualityError } from "./cvProcessing";
 import ResistorVisual from "./components/ResistorVisual";
 import BandsDisplay from "./components/BandsDisplay";
 import ColorReference from "./components/ColorReference";
@@ -18,6 +18,7 @@ export default function App() {
   const [bands, setBands] = useState(null);
   const [result, setResult] = useState(null);
   const [error, setError] = useState(null);
+  const [captureWarning, setCaptureWarning] = useState(null);
   const [facingMode, setFacingMode] = useState("environment");
 
   // ── Burst capture & majority-vote analyze ───────────────────────────────────
@@ -27,12 +28,14 @@ export default function App() {
     if (!video || !canvas || video.readyState < 2) return;
 
     setCapturing(true);
+    setCaptureWarning(null);
     setStatus("Capturing burst…");
 
     try {
-      // Samples ~10 frames over ~400ms and takes a per-band majority vote —
-      // this is what stops single-frame glare/motion-blur from producing
-      // wildly wrong reads.
+      // Samples ~10 frames over ~400ms, geometry-corrected against the
+      // actual visible camera window, white-balanced, and majority-voted —
+      // this is what stops single-frame glare/motion-blur/sampling-offset
+      // from producing wildly wrong reads.
       const votedBands = await burstCaptureAndClassify(video, canvas, numBands, {
         frameCount: 10,
         intervalMs: 40,
@@ -44,6 +47,13 @@ export default function App() {
       const avgConfidence =
         votedBands.reduce((sum, b) => sum + b.confidence, 0) / votedBands.length;
       const confidencePct = Math.round(avgConfidence * 100);
+      const hasUnreadable = votedBands.some((b) => b.band.name === "Unreadable");
+
+      if (hasUnreadable) {
+        setCaptureWarning(
+          "One or more bands couldn't be read reliably (too much glare on that section). Try tilting the resistor slightly or softening the light."
+        );
+      }
 
       setStatus(
         res
@@ -51,8 +61,15 @@ export default function App() {
           : `Capture complete — check alignment (${confidencePct}% confidence)`
       );
     } catch (e) {
-      console.warn("Capture processing error:", e);
-      setStatus("Error processing frame — try again");
+      if (e instanceof CaptureQualityError && e.reason === "overexposed") {
+        setCaptureWarning(
+          "Too much glare — the camera is overexposed and can't read true colors right now. Try: moving away from direct light, angling the resistor away from reflections, or turning off camera flash/torch."
+        );
+        setStatus("Capture failed — overexposed");
+      } else {
+        console.warn("Capture processing error:", e);
+        setStatus("Error processing frame — try again");
+      }
     } finally {
       setCapturing(false);
     }
@@ -60,10 +77,25 @@ export default function App() {
 
   const startCamera = useCallback(async () => {
     setError(null);
+    setCaptureWarning(null);
     try {
       const stream = await navigator.mediaDevices.getUserMedia({
         video: { facingMode, width: { ideal: 1280 }, height: { ideal: 720 } },
       });
+
+      // Defensive: make sure torch/flash isn't on — some mobile browsers
+      // have enabled it unexpectedly in the past, and a torch pointed at a
+      // glossy resistor is a near-guaranteed overexposure source.
+      const track = stream.getVideoTracks()[0];
+      const capabilities = track.getCapabilities?.();
+      if (capabilities?.torch) {
+        try {
+          await track.applyConstraints({ advanced: [{ torch: false }] });
+        } catch {
+          // Not all devices allow this — safe to ignore.
+        }
+      }
+
       if (videoRef.current) {
         videoRef.current.srcObject = stream;
         await videoRef.current.play();
@@ -83,6 +115,7 @@ export default function App() {
     }
     setStreaming(false);
     setCapturing(false);
+    setCaptureWarning(null);
     setBands(null);
     setResult(null);
     setStatus("Idle — press Start");
@@ -175,6 +208,7 @@ export default function App() {
             </div>
 
             {error && <p className="error-msg">{error}</p>}
+            {captureWarning && <p className="warning-msg">⚠️ {captureWarning}</p>}
 
             {/* Band count selector */}
             <div className="band-selector">

@@ -55,6 +55,22 @@ export const COLOR_BANDS = [
 
 const COLOR_BY_NAME = Object.fromEntries(COLOR_BANDS.map((c) => [c.name, c]));
 
+/**
+ * Sentinel used by cvProcessing.js when a band window has too few valid
+ * (non-glare, non-shadow) pixels to trust a real classification. Its digit
+ * and mult are both null, so calcResistance() automatically returns null
+ * instead of silently computing a bogus value — no special-casing needed
+ * downstream.
+ */
+export const UNREADABLE_BAND = {
+  name: "Unreadable",
+  hex: "#3a3f4d",
+  digit: null,
+  mult: null,
+  tol: null,
+  family: "unknown",
+};
+
 // ── Color space conversions ───────────────────────────────────────────────────
 
 /** Parse "#RRGGBB" → [r, g, b] (0-255 each) */
