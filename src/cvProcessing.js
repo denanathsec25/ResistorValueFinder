@@ -166,9 +166,28 @@ function applyGains(r, g, b, gains) {
  * correcting for the object-fit:cover crop between what's shown on screen
  * and the camera's native frame. Falls back to treating the full native
  * frame as visible (no crop) if geometry can't be determined yet.
+ *
+ * BUGFIX: getVisibleCropRect() requires the on-screen container element to
+ * measure its rendered box (via getBoundingClientRect) and compute the
+ * object-fit:cover crop math against it. Previously `container` was never
+ * passed through from the call sites below, so it was always `undefined`
+ * inside getVisibleCropRect() — every call threw a TypeError, which is what
+ * produced the "Error processing frame — try again" status on literally
+ * every Capture press, in both 4-band and 5-band modes, regardless of
+ * lighting or resistor type.
  */
-function resolveNativeROI(video, canvasWidth, canvasHeight) {
-  const crop = video ? getVisibleCropRect(video) : null;
+function resolveNativeROI(video, container, canvasWidth, canvasHeight) {
+  if (video && !container) {
+    // Don't fail silently — a missing container means ROI geometry is
+    // wrong on any cropped (object-fit:cover) display, which is the exact
+    // class of bug that caused the "Error processing frame" failures.
+    console.warn(
+      "[cvProcessing] resolveNativeROI called without a container element — " +
+      "falling back to uncorrected ROI. Pass the .camera-wrap ref via " +
+      "burstCaptureAndClassify(video, canvas, numBands, { container }) to fix sampling alignment."
+    );
+  }
+  const crop = video && container ? getVisibleCropRect(video, container) : null;
   const visible = crop || { x: 0, y: 0, width: canvasWidth, height: canvasHeight };
 
   return {
@@ -248,9 +267,9 @@ function extractBandsFromImageData(imageData, canvasWidth, canvasHeight, numBand
  * @param {4 | 5} numBands
  * @param {HTMLVideoElement} [video]
  */
-export function extractBands(ctx, canvasWidth, canvasHeight, numBands, video = null) {
+export function extractBands(ctx, canvasWidth, canvasHeight, numBands, video = null, container = null) {
   const imageData = ctx.getImageData(0, 0, canvasWidth, canvasHeight);
-  const nativeROI = resolveNativeROI(video, canvasWidth, canvasHeight);
+  const nativeROI = resolveNativeROI(video, container, canvasWidth, canvasHeight);
   return extractBandsFromImageData(imageData, canvasWidth, canvasHeight, numBands, nativeROI);
 }
 
@@ -265,6 +284,11 @@ export function extractBands(ctx, canvasWidth, canvasHeight, numBands, video = n
  * @param {HTMLCanvasElement} canvas
  * @param {4 | 5} numBands
  * @param {object} [opts]
+ * @param {HTMLElement} [opts.container]  – the .camera-wrap element (object-fit:cover
+ *                                          container) — REQUIRED for correct ROI geometry.
+ *                                          Without it, ROI falls back to the full native
+ *                                          frame, which is wrong whenever the displayed
+ *                                          video is cropped (almost always on mobile).
  * @param {number} [opts.frameCount=10]   – good frames to collect
  * @param {number} [opts.intervalMs=40]   – delay between attempts
  * @param {number} [opts.maxAttempts=25]  – give up after this many tries total
@@ -275,7 +299,7 @@ export async function burstCaptureAndClassify(
   video,
   canvas,
   numBands,
-  { frameCount = 10, intervalMs = 40, maxAttempts = 25 } = {}
+  { frameCount = 10, intervalMs = 40, maxAttempts = 25, container = null } = {}
 ) {
   if (!video || video.readyState < 2) {
     throw new CaptureQualityError("Camera feed isn't ready yet.", "video-not-ready");
@@ -294,7 +318,7 @@ export async function burstCaptureAndClassify(
     ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
     const imageData = ctx.getImageData(0, 0, canvas.width, canvas.height);
 
-    const nativeROI = resolveNativeROI(video, canvas.width, canvas.height);
+    const nativeROI = resolveNativeROI(video, container, canvas.width, canvas.height);
     const clipRatio = computeROIClipRatio(
       imageData, nativeROI.x, nativeROI.y, nativeROI.w, nativeROI.h, canvas.width
     );
@@ -368,8 +392,8 @@ function majorityVote(samples) {
  * debugging — overlay this on a frame to confirm the ROI actually lands on
  * the resistor body.
  */
-export function debugDrawSamplingRegions(ctx, canvasWidth, canvasHeight, numBands, video = null) {
-  const { x: roiX, y: roiY, w: roiW, h: roiH } = resolveNativeROI(video, canvasWidth, canvasHeight);
+export function debugDrawSamplingRegions(ctx, canvasWidth, canvasHeight, numBands, video = null, container = null) {
+  const { x: roiX, y: roiY, w: roiW, h: roiH } = resolveNativeROI(video, container, canvasWidth, canvasHeight);
 
   ctx.strokeStyle = "rgba(245,166,35,0.8)";
   ctx.lineWidth = 2;

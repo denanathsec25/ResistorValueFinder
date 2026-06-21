@@ -9,6 +9,7 @@ import "./index.css";
 export default function App() {
   const videoRef = useRef(null);
   const procCanvasRef = useRef(null);
+  const cameraWrapRef = useRef(null); // .camera-wrap element — needed for object-fit:cover geometry correction
 
   const [mode, setMode] = useState("camera"); // "camera" | "ref"
   const [numBands, setNumBands] = useState(4);
@@ -39,6 +40,7 @@ export default function App() {
       const votedBands = await burstCaptureAndClassify(video, canvas, numBands, {
         frameCount: 10,
         intervalMs: 40,
+        container: cameraWrapRef.current,
       });
       const res = calcResistance(votedBands, numBands);
       setBands(votedBands);
@@ -166,7 +168,7 @@ export default function App() {
         {mode === "camera" && (
           <>
             {/* Camera viewfinder */}
-            <div className="camera-wrap">
+            <div className="camera-wrap" ref={cameraWrapRef}>
               <video ref={videoRef} playsInline muted className="video" />
 
               {streaming && (
