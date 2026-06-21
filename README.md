@@ -83,6 +83,8 @@ src/
 ├── main.jsx                 # React entry point
 ├── App.jsx                  # Main application component
 ├── index.css                # Global styling
+├── Bands Display
+├──videoGeometry
 ├── resistorLogic.js         # Color matching and resistance calculations
 ├── cvProcessing.js          # Image processing functions
 └── components/
