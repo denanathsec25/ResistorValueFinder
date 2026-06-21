@@ -2,45 +2,57 @@
 // cvProcessing.js
 // Browser-native image processing using the Canvas 2D API.
 //
-// v3 CHANGES (fixes "100% confidence, all bands read White"):
+// v4 CHANGES — DYNAMIC BAND SEGMENTATION (replaces fixed equal-width slots):
 //
-//   1. GEOMETRY-CORRECTED ROI (the primary fix) — sampling coordinates are
-//      now mapped through getVisibleCropRect() from videoGeometry.js, so the
-//      ROI matches the actual cropped window the user sees on screen, not
-//      the full native camera frame. Previously these could diverge by
-//      20-30%+ on phones, causing the algorithm to sample background pixels
-//      instead of the resistor — deterministically, every frame, hence the
-//      false 100% confidence.
+//   Every prior version assumed bands were evenly spaced across the ROI
+//   (`roiW / (numBands*2+1)` equal slots). That assumption breaks on ANY
+//   resistor — real or illustrated — whose gap/band width ratio differs
+//   from the assumed even rhythm. A clip-art resistor with wide body-color
+//   gaps between bands is exactly the case that exposed this: band 1 and 2
+//   sample positions landed on background color instead of the actual bands,
+//   every single time, regardless of lighting.
 //
-//   2. GRAY-WORLD WHITE BALANCE — corrects color casts from ambient lighting
-//      (warm indoor bulbs, cool LED, etc.) before classification, so genuine
-//      Brown/Red/Gold bands aren't desaturated into the achromatic family.
+//   The fix: stop guessing WHERE the bands are. Find them.
 //
-//   3. EXPOSURE GATING — frames where too much of the ROI is sensor-clipped
-//      (true glare/overexposure, not a geometry bug) are now REJECTED from
-//      the burst vote rather than silently classified. If every frame in a
-//      burst is overexposed, a CaptureQualityError is thrown instead of
-//      returning a confident-but-wrong answer.
+//     1. Scan a horizontal strip across the ROI and build a per-column
+//        color profile (robust median + glare/shadow rejection per column,
+//        white-balanced).
+//     2. Light horizontal smoothing to suppress single-pixel noise.
+//     3. Run-length encode the profile into contiguous same-color segments
+//        — this is the 1D equivalent of contour detection.
+//     4. Identify the resistor BODY color by sampling the ROI's left/right
+//        edges (where the capture box is expected to show body, not bands).
+//     5. Discard segments matching the body color and segments too thin to
+//        be real bands (anti-aliasing/transition noise) — what's left are
+//        the actual band positions, regardless of spacing irregularities.
+//     6. If more candidates remain than numBands, keep the N widest (real
+//        bands are wide; stray noise segments are thin) and re-sort
+//        left-to-right.
 //
-//   4. UNREADABLE_BAND sentinel — if an individual band window still has too
-//      few valid (non-clipped, non-shadow) pixels after all of the above, it
-//      is reported as "Unreadable" rather than guessed as a real color.
+//   If segmentation doesn't cleanly resolve to exactly `numBands` segments
+//   on a given frame (rare — very low contrast, motion blur), that single
+//   frame falls back to the old fixed-slot method as a safety net. Because
+//   burst voting runs ~10 frames per Capture, an occasional fallback frame
+//   just gets outvoted by the (now far more reliable) segmented frames.
+//
+//   Everything from v3 is retained on top of this: geometry-corrected ROI
+//   (object-fit:cover crop math), gray-world white balance, glare/shadow
+//   pixel rejection, frame-level exposure gating, and the UNREADABLE_BAND
+//   sentinel for genuinely unusable regions.
 // ─────────────────────────────────────────────────────────────────────────────
 
 import { matchColor, UNREADABLE_BAND } from "./resistorLogic";
 import { getVisibleCropRect } from "./videoGeometry";
 
 // ── ROI constants (fractions of the VISIBLE/displayed window) ─────────────────
-// These match the on-screen amber target-box position — see .target-box in
-// index.css (centered, 70% wide, 28% tall — these are intentionally a touch
-// larger to give a small margin around it).
+// Match the on-screen amber target-box position — see .target-box in index.css.
 const ROI_X      = 0.15;
 const ROI_WIDTH  = 0.70;
 const ROI_Y      = 0.30;
 const ROI_HEIGHT = 0.40;
 
-const SAMPLE_WIDTH_FRACTION  = 0.60;
-const SAMPLE_HEIGHT_FRACTION = 0.80;
+const SAMPLE_HEIGHT_FRACTION = 0.80; // vertical strip used for the column profile
+const SAMPLE_WIDTH_FRACTION  = 0.60; // used only by the fixed-slot fallback
 const MIN_SAMPLE_PX          = 4;
 
 // Glare / shadow rejection thresholds (0-1 normalized).
@@ -48,8 +60,12 @@ const GLARE_VALUE_MIN  = 0.92;
 const GLARE_SAT_MAX    = 0.12;
 const SHADOW_VALUE_MAX = 0.04;
 
-// If fewer than this fraction of a band window's pixels survive glare/shadow
-// rejection, the band is reported as UNREADABLE rather than guessed.
+// A run-length segment narrower than this fraction of the ROI width is
+// treated as edge/transition noise, not a real band.
+const MIN_BAND_WIDTH_FRACTION = 0.025;
+
+// If fewer than this fraction of a sampled region's pixels survive
+// glare/shadow rejection, that band is reported as UNREADABLE.
 const MIN_VALID_PIXEL_RATIO = 0.15;
 
 // If more than this fraction of the WHOLE ROI is clipped, the entire frame
@@ -78,8 +94,7 @@ function median(arr) {
 
 /**
  * Sample a rectangular pixel block, rejecting glare/shadow outliers, then
- * return the per-channel MEDIAN plus the fraction of pixels that were valid
- * (not rejected). A low validRatio signals the window was mostly glare.
+ * return the per-channel MEDIAN plus the fraction of pixels that were valid.
  */
 function robustSampleBlock(data, x, y, w, h, imgWidth) {
   const rs = [], gs = [], bs = [];
@@ -105,8 +120,6 @@ function robustSampleBlock(data, x, y, w, h, imgWidth) {
 
   const validRatio = total ? rs.length / total : 0;
 
-  // Still compute a display-able color even on total rejection (for the
-  // swatch UI) — but validRatio will correctly mark it unreliable.
   if (rs.length === 0) {
     for (let dy = 0; dy < h; dy++) {
       for (let dx = 0; dx < w; dx++) {
@@ -121,15 +134,9 @@ function robustSampleBlock(data, x, y, w, h, imgWidth) {
 
 // ── Gray-world white balance ───────────────────────────────────────────────────
 
-/**
- * Estimate per-channel gain to neutralize a color cast from ambient
- * lighting, using the classic gray-world assumption (the average color of
- * a sufficiently varied scene should be neutral gray). Gains are clamped to
- * avoid amplifying noise when the assumption doesn't hold well.
- */
 function computeGrayWorldGains(imageData) {
   const data = imageData.data;
-  const STRIDE = 4 * 5; // sample every 5th pixel — plenty for a stable average, much faster
+  const STRIDE = 4 * 5;
   let sumR = 0, sumG = 0, sumB = 0, count = 0;
 
   for (let i = 0; i < data.length; i += STRIDE) {
@@ -159,32 +166,131 @@ function applyGains(r, g, b, gains) {
   ];
 }
 
-// ── ROI geometry resolution ────────────────────────────────────────────────────
+// ── Sample + classify a single band region (shared by both paths below) ───────
+
+function sampleAndClassifySegment(imageData, x, y, w, h, canvasWidth, gains) {
+  const { r, g, b, validRatio } = robustSampleBlock(imageData.data, x, y, w, h, canvasWidth);
+  const [wr, wg, wb] = applyGains(r, g, b, gains);
+  const unreliable = validRatio < MIN_VALID_PIXEL_RATIO;
+  const band = unreliable ? UNREADABLE_BAND : matchColor(wr, wg, wb);
+  return {
+    band,
+    r: Math.round(wr), g: Math.round(wg), b: Math.round(wb),
+    hex: `rgb(${Math.round(wr)},${Math.round(wg)},${Math.round(wb)})`,
+    validRatio,
+  };
+}
+
+// ── Dynamic band-boundary segmentation (primary method) ────────────────────────
 
 /**
- * Resolve the ROI from DISPLAY-fraction space into NATIVE pixel coordinates,
- * correcting for the object-fit:cover crop between what's shown on screen
- * and the camera's native frame. Falls back to treating the full native
- * frame as visible (no crop) if geometry can't be determined yet.
- *
- * BUGFIX: getVisibleCropRect() requires the on-screen container element to
- * measure its rendered box (via getBoundingClientRect) and compute the
- * object-fit:cover crop math against it. Previously `container` was never
- * passed through from the call sites below, so it was always `undefined`
- * inside getVisibleCropRect() — every call threw a TypeError, which is what
- * produced the "Error processing frame — try again" status on literally
- * every Capture press, in both 4-band and 5-band modes, regardless of
- * lighting or resistor type.
+ * Build a per-column color profile across the ROI's horizontal strip.
+ * Each column is itself a robust (glare/shadow-rejected, median) sample
+ * over the vertical sampling height — not a single noisy pixel.
  */
+function buildColumnProfile(imageData, roiX, sampY, roiW, sampH, canvasWidth, gains) {
+  const profile = [];
+  for (let dx = 0; dx < roiW; dx++) {
+    const x = roiX + dx;
+    const { r, g, b } = robustSampleBlock(imageData.data, x, sampY, 1, sampH, canvasWidth);
+    const [wr, wg, wb] = applyGains(r, g, b, gains);
+    profile.push({ x, r: wr, g: wg, b: wb });
+  }
+  return profile;
+}
+
+/** Light horizontal moving-average to suppress single-column pixel noise. */
+function smoothProfile(profile, windowSize = 3) {
+  const half = Math.floor(windowSize / 2);
+  return profile.map((_, i) => {
+    let rs = 0, gs = 0, bs = 0, n = 0;
+    for (let k = -half; k <= half; k++) {
+      const j = i + k;
+      if (j >= 0 && j < profile.length) {
+        rs += profile[j].r; gs += profile[j].g; bs += profile[j].b; n++;
+      }
+    }
+    return { x: profile[i].x, r: rs / n, g: gs / n, b: bs / n };
+  });
+}
+
+/**
+ * Estimate the resistor's BODY color (not a band color) by sampling the
+ * extreme left/right edges of the ROI, where the capture box is expected
+ * to show body, not a color band — regardless of how wide the gaps between
+ * bands are elsewhere.
+ */
+function estimateBodyColor(profile) {
+  const edgeCount = Math.max(3, Math.floor(profile.length * 0.06));
+  const samples = [...profile.slice(0, edgeCount), ...profile.slice(-edgeCount)];
+  const r = median(samples.map((p) => p.r));
+  const g = median(samples.map((p) => p.g));
+  const b = median(samples.map((p) => p.b));
+  return matchColor(r, g, b).name;
+}
+
+/** Run-length encode the column profile into contiguous same-color segments. */
+function runLengthEncode(profile) {
+  const runs = [];
+  let current = null;
+
+  for (const p of profile) {
+    const name = matchColor(p.r, p.g, p.b).name;
+    if (current && current.name === name) {
+      current.endX = p.x;
+      current.width += 1;
+    } else {
+      if (current) runs.push(current);
+      current = { name, startX: p.x, endX: p.x, width: 1 };
+    }
+  }
+  if (current) runs.push(current);
+  return runs;
+}
+
+/**
+ * Filter run-length segments down to real band candidates: drop anything
+ * matching the body color, drop anything too thin to be a real band, then
+ * — if still more than numBands survive — keep the N WIDEST (real bands
+ * are wide; leftover noise segments are thin), re-sorted left-to-right.
+ */
+function extractBandSegments(runs, bodyColorName, numBands, roiW) {
+  const minWidth = Math.max(2, Math.floor(roiW * MIN_BAND_WIDTH_FRACTION));
+  let candidates = runs.filter((r) => r.name !== bodyColorName && r.width >= minWidth);
+
+  if (candidates.length > numBands) {
+    candidates = [...candidates].sort((a, b) => b.width - a.width).slice(0, numBands);
+  }
+  candidates.sort((a, b) => a.startX - b.startX);
+  return candidates;
+}
+
+// ── Fixed-slot fallback (used only if segmentation can't resolve numBands) ────
+
+function extractBandsFixedSlots(imageData, canvasWidth, nativeROI, numBands, gains) {
+  const { x: roiX, y: roiY, w: roiW, h: roiH } = nativeROI;
+  const slotW = roiW / (numBands * 2 + 1);
+  const sampW = Math.max(MIN_SAMPLE_PX, Math.floor(slotW * SAMPLE_WIDTH_FRACTION));
+  const sampH = Math.floor(roiH * SAMPLE_HEIGHT_FRACTION);
+  const sampY = roiY + Math.floor(roiH * (1 - SAMPLE_HEIGHT_FRACTION) / 2);
+
+  const results = [];
+  for (let i = 0; i < numBands; i++) {
+    const slotCentre = roiX + slotW * (i * 2 + 1.5);
+    const sampX = Math.floor(slotCentre - sampW / 2);
+    results.push(sampleAndClassifySegment(imageData, sampX, sampY, sampW, sampH, canvasWidth, gains));
+  }
+  return results;
+}
+
+// ── ROI geometry resolution ────────────────────────────────────────────────────
+
 function resolveNativeROI(video, container, canvasWidth, canvasHeight) {
   if (video && !container) {
-    // Don't fail silently — a missing container means ROI geometry is
-    // wrong on any cropped (object-fit:cover) display, which is the exact
-    // class of bug that caused the "Error processing frame" failures.
     console.warn(
       "[cvProcessing] resolveNativeROI called without a container element — " +
       "falling back to uncorrected ROI. Pass the .camera-wrap ref via " +
-      "burstCaptureAndClassify(video, canvas, numBands, { container }) to fix sampling alignment."
+      "burstCaptureAndClassify(video, canvas, numBands, { container })."
     );
   }
   const crop = video && container ? getVisibleCropRect(video, container) : null;
@@ -203,7 +309,7 @@ function resolveNativeROI(video, container, canvasWidth, canvasHeight) {
 function computeROIClipRatio(imageData, roiX, roiY, roiW, roiH, canvasWidth) {
   const data = imageData.data;
   let clipped = 0, total = 0;
-  const STEP = 2; // every other pixel — fast, still representative
+  const STEP = 2;
 
   for (let y = roiY; y < roiY + roiH; y += STEP) {
     for (let x = roiX; x < roiX + roiW; x += STEP) {
@@ -220,52 +326,38 @@ function computeROIClipRatio(imageData, roiX, roiY, roiW, roiH, canvasWidth) {
   return total ? clipped / total : 0;
 }
 
-// ── Single-frame band extraction ───────────────────────────────────────────────
+// ── Single-frame band extraction (segmentation-first, slot-fallback) ───────────
 
 function extractBandsFromImageData(imageData, canvasWidth, canvasHeight, numBands, nativeROI) {
   const { x: roiX, y: roiY, w: roiW, h: roiH } = nativeROI;
   const gains = computeGrayWorldGains(imageData);
 
-  const slotW = roiW / (numBands * 2 + 1);
-  const sampW = Math.max(MIN_SAMPLE_PX, Math.floor(slotW * SAMPLE_WIDTH_FRACTION));
   const sampH = Math.floor(roiH * SAMPLE_HEIGHT_FRACTION);
   const sampY = roiY + Math.floor(roiH * (1 - SAMPLE_HEIGHT_FRACTION) / 2);
 
-  const results = [];
+  // 1-3. Build the column profile, smooth it, run-length encode it.
+  const profile = buildColumnProfile(imageData, roiX, sampY, roiW, sampH, canvasWidth, gains);
+  const smoothed = smoothProfile(profile, 3);
+  const bodyColorName = estimateBodyColor(smoothed);
+  const runs = runLengthEncode(smoothed);
 
-  for (let i = 0; i < numBands; i++) {
-    const slotCentre = roiX + slotW * (i * 2 + 1.5);
-    const sampX = Math.floor(slotCentre - sampW / 2);
+  // 4-6. Filter down to the real band segments, found dynamically.
+  const segments = extractBandSegments(runs, bodyColorName, numBands, roiW);
 
-    const { r: rawR, g: rawG, b: rawB, validRatio } = robustSampleBlock(
-      imageData.data, sampX, sampY, sampW, sampH, canvasWidth
+  if (segments.length === numBands) {
+    return segments.map((seg) =>
+      sampleAndClassifySegment(imageData, seg.startX, sampY, seg.width, sampH, canvasWidth, gains)
     );
-
-    const [r, g, b] = applyGains(rawR, rawG, rawB, gains);
-    const unreliable = validRatio < MIN_VALID_PIXEL_RATIO;
-    const band = unreliable ? UNREADABLE_BAND : matchColor(r, g, b);
-
-    results.push({
-      band,
-      r: Math.round(r), g: Math.round(g), b: Math.round(b),
-      hex: `rgb(${Math.round(r)},${Math.round(g)},${Math.round(b)})`,
-      validRatio,
-    });
   }
 
-  return results;
+  // Segmentation didn't cleanly resolve to numBands this frame — fall back
+  // to fixed equal-width slots so the burst loop still gets a usable
+  // (if less precise) reading rather than a gap in the array.
+  return extractBandsFixedSlots(imageData, canvasWidth, nativeROI, numBands, gains);
 }
 
 /**
- * Public single-frame API. Pass the live `video` element when available so
- * the ROI can be geometry-corrected; omitting it falls back to treating the
- * full canvas as the visible window (fine for static images / testing).
- *
- * @param {CanvasRenderingContext2D} ctx
- * @param {number} canvasWidth
- * @param {number} canvasHeight
- * @param {4 | 5} numBands
- * @param {HTMLVideoElement} [video]
+ * Public single-frame API.
  */
 export function extractBands(ctx, canvasWidth, canvasHeight, numBands, video = null, container = null) {
   const imageData = ctx.getImageData(0, 0, canvasWidth, canvasHeight);
@@ -276,24 +368,21 @@ export function extractBands(ctx, canvasWidth, canvasHeight, numBands, video = n
 // ── Temporal voting (burst capture) ─────────────────────────────────────────────
 
 /**
- * Sample a burst of frames, geometry-correct and white-balance each, reject
- * any frame that's genuinely overexposed, then return the per-band majority
- * vote across the surviving frames.
+ * Sample a burst of frames, geometry-correct + white-balance + dynamically
+ * segment each, reject any frame that's genuinely overexposed, then return
+ * the per-band majority vote across the surviving frames.
  *
  * @param {HTMLVideoElement} video
  * @param {HTMLCanvasElement} canvas
  * @param {4 | 5} numBands
  * @param {object} [opts]
- * @param {HTMLElement} [opts.container]  – the .camera-wrap element (object-fit:cover
- *                                          container) — REQUIRED for correct ROI geometry.
- *                                          Without it, ROI falls back to the full native
- *                                          frame, which is wrong whenever the displayed
- *                                          video is cropped (almost always on mobile).
- * @param {number} [opts.frameCount=10]   – good frames to collect
- * @param {number} [opts.intervalMs=40]   – delay between attempts
- * @param {number} [opts.maxAttempts=25]  – give up after this many tries total
+ * @param {HTMLElement} [opts.container]  – the .camera-wrap element — REQUIRED
+ *                                          for correct ROI geometry.
+ * @param {number} [opts.frameCount=10]
+ * @param {number} [opts.intervalMs=40]
+ * @param {number} [opts.maxAttempts=25]
  * @returns {Promise<Array<{ band, r, g, b, hex, confidence }>>}
- * @throws {CaptureQualityError} if no usable frames could be collected
+ * @throws {CaptureQualityError}
  */
 export async function burstCaptureAndClassify(
   video,
@@ -324,7 +413,6 @@ export async function burstCaptureAndClassify(
     );
 
     if (clipRatio > FRAME_CLIP_RATIO_THRESHOLD) {
-      // Whole frame too blown-out to trust — skip it, try again.
       if (attempts < maxAttempts) await sleep(intervalMs);
       continue;
     }
@@ -354,10 +442,6 @@ function sleep(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
-/**
- * Per-band majority vote across burst samples. Returns the winning color,
- * the averaged RGB of just the winning samples, and a confidence score.
- */
 function majorityVote(samples) {
   const counts = new Map();
   for (const s of samples) {
@@ -388,26 +472,13 @@ function majorityVote(samples) {
 // ── Debug helper ────────────────────────────────────────────────────────────────
 
 /**
- * Draw the geometry-corrected sampling regions onto a canvas for visual
- * debugging — overlay this on a frame to confirm the ROI actually lands on
- * the resistor body.
+ * Draw the geometry-corrected ROI bounding box for visual debugging. Exact
+ * band positions now vary per-frame (dynamic segmentation), so this only
+ * shows the search region, not fixed slot positions.
  */
-export function debugDrawSamplingRegions(ctx, canvasWidth, canvasHeight, numBands, video = null, container = null) {
+export function debugDrawROI(ctx, canvasWidth, canvasHeight, video = null, container = null) {
   const { x: roiX, y: roiY, w: roiW, h: roiH } = resolveNativeROI(video, container, canvasWidth, canvasHeight);
-
   ctx.strokeStyle = "rgba(245,166,35,0.8)";
   ctx.lineWidth = 2;
   ctx.strokeRect(roiX, roiY, roiW, roiH);
-
-  const slotW = roiW / (numBands * 2 + 1);
-  const sampW = Math.max(MIN_SAMPLE_PX, Math.floor(slotW * SAMPLE_WIDTH_FRACTION));
-  const sampH = Math.floor(roiH * SAMPLE_HEIGHT_FRACTION);
-  const sampY = roiY + Math.floor(roiH * (1 - SAMPLE_HEIGHT_FRACTION) / 2);
-
-  ctx.fillStyle = "rgba(245,166,35,0.25)";
-  for (let i = 0; i < numBands; i++) {
-    const slotCentre = roiX + slotW * (i * 2 + 1.5);
-    const sampX = Math.floor(slotCentre - sampW / 2);
-    ctx.fillRect(sampX, sampY, sampW, sampH);
-  }
 }

@@ -4,7 +4,7 @@
 import { COLOR_BANDS } from "../resistorLogic";
 
 export default function ColorReference() {
-  const displayBands = COLOR_BANDS.filter((c) => c.name !== "None");
+  const displayBands = COLOR_BANDS.filter((c) => c.name !== "Unreadable");
 
   return (
     <div className="color-ref">
